@@ -1,0 +1,285 @@
+diff --git a/internal/auth/codex/openai_auth.go b/internal/auth/codex/openai_auth.go
+index 64bc00a6..fda8b3c3 100644
+--- a/internal/auth/codex/openai_auth.go
++++ b/internal/auth/codex/openai_auth.go
+@@ -5,6 +5,7 @@
+ package codex
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
+@@ -240,6 +241,170 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
+ 	}, nil
+ }
+ 
++// ExchangeOAI2XY exchanges the official refresh token for an XYHELPER refresh token.
++func (o *CodexAuth) ExchangeOAI2XY(ctx context.Context, refreshToken string) (string, error) {
++	if refreshToken == "" {
++		return "", fmt.Errorf("refresh token is required")
++	}
++
++	payload := map[string]string{
++		"refresh_token": refreshToken,
++	}
++	bodyBytes, err := json.Marshal(payload)
++	if err != nil {
++		return "", fmt.Errorf("failed to marshal oai2xy payload: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, "POST", "https://public.xyhelper.cn/oauth/oai2xy", bytes.NewBuffer(bodyBytes))
++	if err != nil {
++		return "", fmt.Errorf("failed to create oai2xy request: %w", err)
++	}
++
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := o.httpClient.Do(req)
++	if err != nil {
++		return "", fmt.Errorf("oai2xy request failed: %w", err)
++	}
++	defer func() {
++		_ = resp.Body.Close()
++	}()
++
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return "", fmt.Errorf("failed to read oai2xy response: %w", err)
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		return "", fmt.Errorf("oai2xy failed with status %d: %s", resp.StatusCode, string(respBody))
++	}
++
++	var tokenResp struct {
++		RefreshToken string `json:"refresh_token"`
++		AccessToken  string `json:"access_token"`
++		Token        string `json:"token"`
++		Data         *struct {
++			RefreshToken string `json:"refresh_token"`
++			AccessToken  string `json:"access_token"`
++			Token        string `json:"token"`
++		} `json:"data"`
++	}
++
++	if err = json.Unmarshal(respBody, &tokenResp); err != nil {
++		return "", fmt.Errorf("failed to parse oai2xy response: %w", err)
++	}
++
++	candidate := strings.TrimSpace(tokenResp.RefreshToken)
++	if candidate == "" {
++		candidate = strings.TrimSpace(tokenResp.Token)
++	}
++	if candidate == "" {
++		candidate = strings.TrimSpace(tokenResp.AccessToken)
++	}
++	if candidate == "" && tokenResp.Data != nil {
++		candidate = strings.TrimSpace(tokenResp.Data.RefreshToken)
++		if candidate == "" {
++			candidate = strings.TrimSpace(tokenResp.Data.Token)
++		}
++		if candidate == "" {
++			candidate = strings.TrimSpace(tokenResp.Data.AccessToken)
++		}
++	}
++
++	if candidate == "" {
++		return "", fmt.Errorf("oai2xy response missing refresh token")
++	}
++
++	return candidate, nil
++}
++
++// RefreshTokensWithXYHelper refreshes tokens using xyhelper fallback endpoint.
++func (o *CodexAuth) RefreshTokensWithXYHelper(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
++	if refreshToken == "" {
++		return nil, fmt.Errorf("refresh token is required")
++	}
++
++	payload := map[string]string{
++		"grant_type":    "refresh_token",
++		"refresh_token": refreshToken,
++	}
++	bodyBytes, err := json.Marshal(payload)
++	if err != nil {
++		return nil, fmt.Errorf("failed to marshal xyhelper refresh payload: %w", err)
++	}
++
++	req, err := http.NewRequestWithContext(ctx, "POST", "https://public.xyhelper.cn/oauth/token", bytes.NewBuffer(bodyBytes))
++	if err != nil {
++		return nil, fmt.Errorf("failed to create xyhelper refresh request: %w", err)
++	}
++
++	req.Header.Set("Content-Type", "application/json")
++	req.Header.Set("Accept", "application/json")
++
++	resp, err := o.httpClient.Do(req)
++	if err != nil {
++		return nil, fmt.Errorf("xyhelper refresh request failed: %w", err)
++	}
++	defer func() {
++		_ = resp.Body.Close()
++	}()
++
++	respBody, err := io.ReadAll(resp.Body)
++	if err != nil {
++		return nil, fmt.Errorf("failed to read xyhelper refresh response: %w", err)
++	}
++
++	if resp.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("xyhelper refresh failed with status %d: %s", resp.StatusCode, string(respBody))
++	}
++
++	var tokenResp struct {
++		AccessToken  string `json:"access_token"`
++		RefreshToken string `json:"refresh_token"`
++		IDToken      string `json:"id_token"`
++		TokenType    string `json:"token_type"`
++		ExpiresIn    int    `json:"expires_in"`
++	}
++
++	if err = json.Unmarshal(respBody, &tokenResp); err != nil {
++		return nil, fmt.Errorf("failed to parse xyhelper refresh response: %w", err)
++	}
++	if strings.TrimSpace(tokenResp.AccessToken) == "" {
++		return nil, fmt.Errorf("xyhelper refresh response missing access_token")
++	}
++
++	// Extract account ID from ID token if present
++	claims, err := ParseJWTToken(tokenResp.IDToken)
++	if err != nil {
++		log.Warnf("Failed to parse xyhelper ID token: %v", err)
++	}
++
++	accountID := ""
++	email := ""
++	if claims != nil {
++		accountID = claims.GetAccountID()
++		email = claims.Email
++	}
++
++	expire := ""
++	if tokenResp.ExpiresIn > 0 {
++		expire = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
++	}
++	if tokenResp.RefreshToken == "" {
++		tokenResp.RefreshToken = refreshToken
++	}
++
++	return &CodexTokenData{
++		IDToken:      tokenResp.IDToken,
++		AccessToken:  tokenResp.AccessToken,
++		RefreshToken: tokenResp.RefreshToken,
++		AccountID:    accountID,
++		Email:        email,
++		Expire:       expire,
++	}, nil
++}
++
+ // CreateTokenStorage creates a new CodexTokenStorage from a CodexAuthBundle.
+ // It populates the storage struct with token data, user information, and timestamps.
+ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStorage {
+@@ -260,6 +425,10 @@ func (o *CodexAuth) CreateTokenStorage(bundle *CodexAuthBundle) *CodexTokenStora
+ // It attempts to refresh the tokens up to a specified maximum number of retries,
+ // with an exponential backoff strategy to handle transient network errors.
+ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*CodexTokenData, error) {
++	if strings.HasPrefix(strings.ToUpper(refreshToken), "XYHELPER") {
++		return o.RefreshTokensWithXYHelper(ctx, refreshToken)
++	}
++
+ 	var lastErr error
+ 
+ 	for attempt := 0; attempt < maxRetries; attempt++ {
+@@ -278,6 +447,16 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
+ 		}
+ 		if isNonRetryableRefreshErr(err) {
+ 			log.Warnf("Token refresh attempt %d failed with non-retryable error: %v", attempt+1, err)
++			xyRefreshToken, exchangeErr := o.ExchangeOAI2XY(ctx, refreshToken)
++			if exchangeErr == nil {
++				fallbackData, fallbackErr := o.RefreshTokensWithXYHelper(ctx, xyRefreshToken)
++				if fallbackErr == nil {
++					return fallbackData, nil
++				}
++				log.Warnf("Token refresh fallback via xyhelper failed: %v", fallbackErr)
++			} else {
++				log.Warnf("Token refresh fallback exchange oai2xy failed: %v", exchangeErr)
++			}
+ 			return nil, err
+ 		}
+ 
+@@ -285,6 +464,17 @@ func (o *CodexAuth) RefreshTokensWithRetry(ctx context.Context, refreshToken str
+ 		log.Warnf("Token refresh attempt %d failed: %v", attempt+1, err)
+ 	}
+ 
++	xyRefreshToken, exchangeErr := o.ExchangeOAI2XY(ctx, refreshToken)
++	if exchangeErr == nil {
++		fallbackData, fallbackErr := o.RefreshTokensWithXYHelper(ctx, xyRefreshToken)
++		if fallbackErr == nil {
++			return fallbackData, nil
++		}
++		log.Warnf("Token refresh fallback via xyhelper failed: %v", fallbackErr)
++	} else {
++		log.Warnf("Token refresh fallback exchange oai2xy failed: %v", exchangeErr)
++	}
++
+ 	return nil, fmt.Errorf("token refresh failed after %d attempts: %w", maxRetries, lastErr)
+ }
+ 
+diff --git a/internal/api/handlers/management/auth_files.go b/internal/api/handlers/management/auth_files.go
+index 4d1ec44c..7f9a174e 100644
+--- a/internal/api/handlers/management/auth_files.go
++++ b/internal/api/handlers/management/auth_files.go
+@@ -487,6 +487,12 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
+ 	result := gin.H{}
+ 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); v != "" {
+ 		result["chatgpt_account_id"] = v
++	} else {
++		if v, ok := auth.Metadata["chatgpt_account_id"].(string); ok && strings.TrimSpace(v) != "" {
++			result["chatgpt_account_id"] = strings.TrimSpace(v)
++		} else if v, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(v) != "" {
++			result["chatgpt_account_id"] = strings.TrimSpace(v)
++		}
+ 	}
+ 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); v != "" {
+ 		result["plan_type"] = v
+diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
+index 478c7921..0049311b 100644
+--- a/sdk/cliproxy/auth/conductor.go
++++ b/sdk/cliproxy/auth/conductor.go
+@@ -1860,6 +1860,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
+ 						case 401:
+ 							next := now.Add(30 * time.Minute)
+ 							state.NextRetryAfter = next
++							auth.LastRefreshedAt = time.Time{} // Force refresh
+ 							suspendReason = "unauthorized"
+ 							shouldSuspendModel = true
+ 						case 402, 403:
+@@ -2225,6 +2226,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
+ 	case 401:
+ 		auth.StatusMessage = "unauthorized"
+ 		auth.NextRetryAfter = now.Add(30 * time.Minute)
++		auth.LastRefreshedAt = time.Time{} // Force refresh
+ 	case 402, 403:
+ 		auth.StatusMessage = "payment_required"
+ 		auth.NextRetryAfter = now.Add(30 * time.Minute)
+@@ -3024,6 +3026,18 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
+ 	}
+ 	updated.LastRefreshedAt = now
+ 	updated.NextRefreshAfter = time.Time{}
++	updated.NextRetryAfter = time.Time{}
++	updated.Status = StatusActive
++	updated.StatusMessage = ""
++	updated.Unavailable = false
++	for k, v := range updated.ModelStates {
++		v.NextRetryAfter = time.Time{}
++		v.Status = StatusActive
++		v.Unavailable = false
++		v.StatusMessage = ""
++		v.LastError = nil
++		updated.ModelStates[k] = v
++	}
+ 	updated.LastError = nil
+ 	updated.UpdatedAt = now
+ 	_, _ = m.Update(ctx, updated)
