@@ -1,0 +1,47 @@
+diff --git a/internal/api/handlers/management/auth_files.go b/internal/api/handlers/management/auth_files.go
+index 91f391ac..ea6ac7ca 100644
+--- a/internal/api/handlers/management/auth_files.go
++++ b/internal/api/handlers/management/auth_files.go
+@@ -474,25 +474,37 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
+ 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+ 		return nil
+ 	}
++	fallbackAccountID := ""
++	if tokenStorage, ok := auth.Storage.(*codex.CodexTokenStorage); ok && tokenStorage != nil {
++		fallbackAccountID = tokenStorage.AccountID
++	}
++	if fallbackAccountID == "" {
++		if v, ok := auth.Metadata["account_id"].(string); ok {
++			fallbackAccountID = strings.TrimSpace(v)
++		}
++	}
++	if fallbackAccountID == "" {
++		fallbackAccountID = "xyhelper-fallback-id"
++	}
++
+ 	idTokenRaw, ok := auth.Metadata["id_token"].(string)
+ 	if !ok {
+-		return gin.H{"chatgpt_account_id": "xyhelper-fallback-id"}
++		return gin.H{"chatgpt_account_id": fallbackAccountID}
+ 	}
+ 	idToken := strings.TrimSpace(idTokenRaw)
+ 	if idToken == "" {
+-		return gin.H{"chatgpt_account_id": "xyhelper-fallback-id"}
++		return gin.H{"chatgpt_account_id": fallbackAccountID}
+ 	}
+ 	claims, err := codex.ParseJWTToken(idToken)
+ 	if err != nil || claims == nil {
+-		return gin.H{"chatgpt_account_id": "xyhelper-fallback-id"}
++		return gin.H{"chatgpt_account_id": fallbackAccountID}
+ 	}
+ 
+ 	result := gin.H{}
+ 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); v != "" {
+ 		result["chatgpt_account_id"] = v
+ 	} else {
+-		// Mock account ID for XYHelper or missing account ID so the Quota Inspector works.
+-		result["chatgpt_account_id"] = "xyhelper-fallback-id"
++		result["chatgpt_account_id"] = fallbackAccountID
+ 	}
+ 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); v != "" {
+ 		result["plan_type"] = v
