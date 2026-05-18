@@ -159,15 +159,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 	}
 	coreauth.ApplyCustomHeadersFromMetadata(a)
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
-	// For codex auth files, extract plan_type from the JWT id_token.
+	// For codex auth files, extract plan_type and correct account_id from the JWT tokens.
 	if provider == "codex" {
-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
-			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
-					a.Attributes["plan_type"] = pt
-				}
-			}
-		}
+		extractCodexMetadataFromJWT(a, metadata)
 	}
 	if provider == "gemini-cli" {
 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
@@ -181,6 +175,44 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 		}
 	}
 	return []*coreauth.Auth{a}
+}
+
+// extractCodexMetadataFromJWT extracts plan_type and corrects account_id from JWT tokens
+// in codex auth files. XYHelper tokens may have an incorrect account_id in the credential
+// file; this function derives the correct value from the JWT's organizations list or poid field.
+func extractCodexMetadataFromJWT(a *coreauth.Auth, metadata map[string]any) {
+	jwtAccountID := ""
+
+	// Try id_token first.
+	if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+		if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+				a.Attributes["plan_type"] = pt
+			}
+			jwtAccountID = claims.GetAccountID()
+		}
+	}
+
+	// Fallback: try access_token if id_token didn't yield an account_id.
+	// XYHelper access_tokens contain a "poid" field in the "https://api.openai.com/auth" claim
+	// that corresponds to the organization ID needed for the Chatgpt-Account-Id header.
+	if jwtAccountID == "" {
+		if atRaw, ok := metadata["access_token"].(string); ok && strings.TrimSpace(atRaw) != "" {
+			if atClaims, errParse := codex.ParseJWTToken(atRaw); errParse == nil && atClaims != nil {
+				jwtAccountID = atClaims.GetAccountID()
+			}
+		}
+	}
+
+	// Update account_id in metadata if the JWT-derived value differs from the stored one.
+	// This fixes the mismatch where XYHelper credential files may contain a stale or
+	// incorrect account_id (e.g., "84293469-..." instead of "org-...").
+	if jwtAccountID != "" {
+		existingID, _ := metadata["account_id"].(string)
+		if existingID != jwtAccountID {
+			metadata["account_id"] = jwtAccountID
+		}
+	}
 }
 
 // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.

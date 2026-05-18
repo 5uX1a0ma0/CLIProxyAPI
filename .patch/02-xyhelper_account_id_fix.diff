@@ -1,0 +1,132 @@
+diff --git a/internal/auth/codex/jwt_parser.go b/internal/auth/codex/jwt_parser.go
+index 130e8642..5c58c78d 100644
+--- a/internal/auth/codex/jwt_parser.go
++++ b/internal/auth/codex/jwt_parser.go
+@@ -48,6 +48,7 @@ type CodexAuthInfo struct {
+ 	ChatgptUserID                  string          `json:"chatgpt_user_id"`
+ 	Groups                         []any           `json:"groups"`
+ 	Organizations                  []Organizations `json:"organizations"`
++	Poid                           string          `json:"poid"`
+ 	UserID                         string          `json:"user_id"`
+ }
+ 
+@@ -97,6 +98,28 @@ func (c *JWTClaims) GetUserEmail() string {
+ 
+ // GetAccountID extracts the user's account ID (subject) from the JWT claims.
+ // It retrieves the unique identifier for the user's ChatGPT account.
++// For XYHelper tokens that lack chatgpt_account_id, it falls back to:
++// 1. The poid field (present in access_token JWTs)
++// 2. The default organization ID from the organizations list
++// 3. The first organization ID if no default is set
+ func (c *JWTClaims) GetAccountID() string {
+-	return c.CodexAuthInfo.ChatgptAccountID
++	if c.CodexAuthInfo.ChatgptAccountID != "" {
++		return c.CodexAuthInfo.ChatgptAccountID
++	}
++	// Fallback 1: use poid field (available in access_token JWTs from XYHelper).
++	if c.CodexAuthInfo.Poid != "" {
++		return c.CodexAuthInfo.Poid
++	}
++	// Fallback 2: use the default organization ID from the organizations list.
++	// XYHelper tokens typically have organizations but no chatgpt_account_id.
++	for _, org := range c.CodexAuthInfo.Organizations {
++		if org.IsDefault {
++			return org.ID
++		}
++	}
++	// Fallback 3: if no default org, use the first one.
++	if len(c.CodexAuthInfo.Organizations) > 0 {
++		return c.CodexAuthInfo.Organizations[0].ID
++	}
++	return ""
+ }
+diff --git a/internal/auth/codex/openai_auth.go b/internal/auth/codex/openai_auth.go
+index 2be37213..efe8a8de 100644
+--- a/internal/auth/codex/openai_auth.go
++++ b/internal/auth/codex/openai_auth.go
+@@ -403,6 +403,18 @@ func (o *CodexAuth) RefreshXYHelperTokens(ctx context.Context, refreshToken stri
+ 		}
+ 	}
+ 
++	// Fallback: if account ID is still empty, try to extract poid from the access_token JWT.
++	// XYHelper access_tokens contain a "poid" field in the "https://api.openai.com/auth" claim
++	// that corresponds to the organization ID needed for the Chatgpt-Account-Id header.
++	if accountID == "" && tokenResp.AccessToken != "" {
++		if atClaims, errParse := ParseJWTToken(tokenResp.AccessToken); errParse == nil && atClaims != nil {
++			accountID = atClaims.GetAccountID()
++			if email == "" {
++				email = atClaims.Email
++			}
++		}
++	}
++
+ 	expireStr := ""
+ 	if tokenResp.ExpiresIn > 0 {
+ 		expireStr = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
+diff --git a/internal/watcher/synthesizer/file.go b/internal/watcher/synthesizer/file.go
+index 49a635e7..8ba88c15 100644
+--- a/internal/watcher/synthesizer/file.go
++++ b/internal/watcher/synthesizer/file.go
+@@ -159,15 +159,9 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
+ 	}
+ 	coreauth.ApplyCustomHeadersFromMetadata(a)
+ 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
+-	// For codex auth files, extract plan_type from the JWT id_token.
++	// For codex auth files, extract plan_type and correct account_id from the JWT tokens.
+ 	if provider == "codex" {
+-		if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
+-			if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
+-				if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
+-					a.Attributes["plan_type"] = pt
+-				}
+-			}
+-		}
++		extractCodexMetadataFromJWT(a, metadata)
+ 	}
+ 	if provider == "gemini-cli" {
+ 		if virtuals := SynthesizeGeminiVirtualAuths(a, metadata, now); len(virtuals) > 0 {
+@@ -183,6 +177,44 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
+ 	return []*coreauth.Auth{a}
+ }
+ 
++// extractCodexMetadataFromJWT extracts plan_type and corrects account_id from JWT tokens
++// in codex auth files. XYHelper tokens may have an incorrect account_id in the credential
++// file; this function derives the correct value from the JWT's organizations list or poid field.
++func extractCodexMetadataFromJWT(a *coreauth.Auth, metadata map[string]any) {
++	jwtAccountID := ""
++
++	// Try id_token first.
++	if idTokenRaw, ok := metadata["id_token"].(string); ok && strings.TrimSpace(idTokenRaw) != "" {
++		if claims, errParse := codex.ParseJWTToken(idTokenRaw); errParse == nil && claims != nil {
++			if pt := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); pt != "" {
++				a.Attributes["plan_type"] = pt
++			}
++			jwtAccountID = claims.GetAccountID()
++		}
++	}
++
++	// Fallback: try access_token if id_token didn't yield an account_id.
++	// XYHelper access_tokens contain a "poid" field in the "https://api.openai.com/auth" claim
++	// that corresponds to the organization ID needed for the Chatgpt-Account-Id header.
++	if jwtAccountID == "" {
++		if atRaw, ok := metadata["access_token"].(string); ok && strings.TrimSpace(atRaw) != "" {
++			if atClaims, errParse := codex.ParseJWTToken(atRaw); errParse == nil && atClaims != nil {
++				jwtAccountID = atClaims.GetAccountID()
++			}
++		}
++	}
++
++	// Update account_id in metadata if the JWT-derived value differs from the stored one.
++	// This fixes the mismatch where XYHelper credential files may contain a stale or
++	// incorrect account_id (e.g., "84293469-..." instead of "org-...").
++	if jwtAccountID != "" {
++		existingID, _ := metadata["account_id"].(string)
++		if existingID != jwtAccountID {
++			metadata["account_id"] = jwtAccountID
++		}
++	}
++}
++
+ // SynthesizeGeminiVirtualAuths creates virtual Auth entries for multi-project Gemini credentials.
+ // It disables the primary auth and creates one virtual auth per project.
+ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]any, now time.Time) []*coreauth.Auth {

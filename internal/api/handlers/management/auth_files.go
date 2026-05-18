@@ -504,22 +504,38 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return nil
 	}
+
+	fallbackAccountID := ""
+	if tokenStorage, ok := auth.Storage.(*codex.CodexTokenStorage); ok && tokenStorage != nil {
+		fallbackAccountID = tokenStorage.AccountID
+	}
+	if fallbackAccountID == "" {
+		if v, ok := auth.Metadata["account_id"].(string); ok {
+			fallbackAccountID = strings.TrimSpace(v)
+		}
+	}
+	if fallbackAccountID == "" {
+		fallbackAccountID = "xyhelper-fallback-id"
+	}
+
 	idTokenRaw, ok := auth.Metadata["id_token"].(string)
 	if !ok {
-		return nil
+		return gin.H{"chatgpt_account_id": fallbackAccountID}
 	}
 	idToken := strings.TrimSpace(idTokenRaw)
 	if idToken == "" {
-		return nil
+		return gin.H{"chatgpt_account_id": fallbackAccountID}
 	}
 	claims, err := codex.ParseJWTToken(idToken)
 	if err != nil || claims == nil {
-		return nil
+		return gin.H{"chatgpt_account_id": fallbackAccountID}
 	}
 
 	result := gin.H{}
 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); v != "" {
 		result["chatgpt_account_id"] = v
+	} else {
+		result["chatgpt_account_id"] = fallbackAccountID
 	}
 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); v != "" {
 		result["plan_type"] = v

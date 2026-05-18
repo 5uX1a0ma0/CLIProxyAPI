@@ -322,3 +322,132 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
 }
+
+// XYHelperTokenURL is the endpoint for refreshing XYHelper-format refresh tokens.
+const XYHelperTokenURL = "https://public.xyhelper.cn/oauth/token"
+
+// IsXYHelperRefreshToken reports whether the given refresh token is in XYHelper format.
+// XYHelper refresh tokens are prefixed with "xyhelpertoken".
+func IsXYHelperRefreshToken(refreshToken string) bool {
+	return strings.HasPrefix(refreshToken, "xyhelpertoken")
+}
+
+// RefreshXYHelperTokens exchanges an XYHelper-format refresh token for a new access token
+// by calling the XYHelper OAuth endpoint (https://public.xyhelper.cn/oauth/token).
+// The response access_token is a standard OpenAI JWT that can be used directly with
+// the Codex API. The refresh_token in the response remains in XYHelper format.
+func (o *CodexAuth) RefreshXYHelperTokens(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
+	if refreshToken == "" {
+		return nil, fmt.Errorf("xyhelper: refresh token is required")
+	}
+
+	reqBody, err := json.Marshal(map[string]string{
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("xyhelper: failed to marshal request body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, XYHelperTokenURL, strings.NewReader(string(reqBody)))
+	if err != nil {
+		return nil, fmt.Errorf("xyhelper: failed to create refresh request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("xyhelper: token refresh request failed: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("xyhelper: failed to read refresh response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("xyhelper: token refresh failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+		ExpiresIn    int    `json:"expires_in"`
+	}
+	if err = json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, fmt.Errorf("xyhelper: failed to parse refresh response: %w", err)
+	}
+	if tokenResp.AccessToken == "" {
+		return nil, fmt.Errorf("xyhelper: refresh response missing access_token: %s", string(body))
+	}
+
+	// Preserve the original XYHelper refresh token if the response does not return a new one.
+	newRefreshToken := tokenResp.RefreshToken
+	if newRefreshToken == "" {
+		newRefreshToken = refreshToken
+	}
+
+	// Extract account ID and email from the returned ID token when available.
+	accountID := ""
+	email := ""
+	idToken := tokenResp.IDToken
+	if idToken != "" {
+		if claims, errParse := ParseJWTToken(idToken); errParse == nil && claims != nil {
+			accountID = claims.GetAccountID()
+			email = claims.Email
+		}
+	}
+
+	// Fallback: if account ID is still empty, try to extract poid from the access_token JWT.
+	// XYHelper access_tokens contain a "poid" field in the "https://api.openai.com/auth" claim
+	// that corresponds to the organization ID needed for the Chatgpt-Account-Id header.
+	if accountID == "" && tokenResp.AccessToken != "" {
+		if atClaims, errParse := ParseJWTToken(tokenResp.AccessToken); errParse == nil && atClaims != nil {
+			accountID = atClaims.GetAccountID()
+			if email == "" {
+				email = atClaims.Email
+			}
+		}
+	}
+
+	expireStr := ""
+	if tokenResp.ExpiresIn > 0 {
+		expireStr = time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second).Format(time.RFC3339)
+	}
+
+	return &CodexTokenData{
+		IDToken:      idToken,
+		AccessToken:  tokenResp.AccessToken,
+		RefreshToken: newRefreshToken,
+		AccountID:    accountID,
+		Email:        email,
+		Expire:       expireStr,
+	}, nil
+}
+
+// RefreshXYHelperTokensWithRetry refreshes XYHelper tokens with a built-in retry mechanism.
+// It attempts to refresh the tokens up to maxRetries times with exponential backoff.
+func (o *CodexAuth) RefreshXYHelperTokensWithRetry(ctx context.Context, refreshToken string, maxRetries int) (*CodexTokenData, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		tokenData, err := o.RefreshXYHelperTokens(ctx, refreshToken)
+		if err == nil {
+			return tokenData, nil
+		}
+		lastErr = err
+		log.Warnf("XYHelper token refresh attempt %d failed: %v", attempt+1, err)
+	}
+	return nil, fmt.Errorf("xyhelper: token refresh failed after %d attempts: %w", maxRetries, lastErr)
+}

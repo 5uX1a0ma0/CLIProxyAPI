@@ -1,0 +1,54 @@
+name: Sync Upstream and Patch
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天凌晨 2 点自动运行
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  sync_and_patch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "SuXiaomao"
+          git config --global user.email "xiaomao@hermes.local"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/router-for-me/CLIProxyAPI.git
+          git fetch upstream
+
+      - name: Sync with upstream
+        run: |
+          # 强制同步上游的 main 分支
+          git reset --hard upstream/main
+          # 恢复工作流避免 GITHUB_TOKEN 的无权限报错，然后恢复补丁文件
+          git checkout origin/main -- .github/workflows/
+          git checkout origin/main -- .patch/
+          
+      - name: Apply XYHelper Patches
+        run: |
+          # 按照顺序应用所有补丁
+          for patch in .patch/*.diff; do
+            echo "Applying $patch..."
+            git apply --reject --whitespace=fix "$patch" || true
+          done
+          
+          # 清理掉 reject 文件
+          find . -name "*.rej" -delete
+
+          # 提交修改
+          git add .
+          git commit -m "chore: auto-apply all xyhelper patches to latest upstream" || echo "No changes to commit"
+          
+          # 强制推送到我们自己的 repo
+          git push -f origin main

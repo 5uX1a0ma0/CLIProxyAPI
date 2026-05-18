@@ -48,6 +48,7 @@ type CodexAuthInfo struct {
 	ChatgptUserID                  string          `json:"chatgpt_user_id"`
 	Groups                         []any           `json:"groups"`
 	Organizations                  []Organizations `json:"organizations"`
+	Poid                           string          `json:"poid"`
 	UserID                         string          `json:"user_id"`
 }
 
@@ -97,6 +98,28 @@ func (c *JWTClaims) GetUserEmail() string {
 
 // GetAccountID extracts the user's account ID (subject) from the JWT claims.
 // It retrieves the unique identifier for the user's ChatGPT account.
+// For XYHelper tokens that lack chatgpt_account_id, it falls back to:
+// 1. The poid field (present in access_token JWTs)
+// 2. The default organization ID from the organizations list
+// 3. The first organization ID if no default is set
 func (c *JWTClaims) GetAccountID() string {
-	return c.CodexAuthInfo.ChatgptAccountID
+	if c.CodexAuthInfo.ChatgptAccountID != "" {
+		return c.CodexAuthInfo.ChatgptAccountID
+	}
+	// Fallback 1: use poid field (available in access_token JWTs from XYHelper).
+	if c.CodexAuthInfo.Poid != "" {
+		return c.CodexAuthInfo.Poid
+	}
+	// Fallback 2: use the default organization ID from the organizations list.
+	// XYHelper tokens typically have organizations but no chatgpt_account_id.
+	for _, org := range c.CodexAuthInfo.Organizations {
+		if org.IsDefault {
+			return org.ID
+		}
+	}
+	// Fallback 3: if no default org, use the first one.
+	if len(c.CodexAuthInfo.Organizations) > 0 {
+		return c.CodexAuthInfo.Organizations[0].ID
+	}
+	return ""
 }

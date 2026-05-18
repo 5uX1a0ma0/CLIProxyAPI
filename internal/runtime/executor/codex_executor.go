@@ -709,7 +709,14 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 		return auth, nil
 	}
 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	var td *codexauth.CodexTokenData
+	var err error
+	if codexauth.IsXYHelperRefreshToken(refreshToken) {
+		log.Debugf("codex executor: detected XYHelper refresh token, using XYHelper token endpoint")
+		td, err = svc.RefreshXYHelperTokensWithRetry(ctx, refreshToken, 3)
+	} else {
+		td, err = svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
+	}
 	if err != nil {
 		return nil, err
 	}
